@@ -19,6 +19,10 @@ rake dms:update_tasks      # Modify replication task
 
 ## Configure with default_params.yml
 
+```bash
+cp default_params.example.yml default_params.yml
+```
+
 ### Region
 ```yml
 region: us-west-2
