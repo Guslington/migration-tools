@@ -1,0 +1,54 @@
+region: us-west-2
+
+aws_profile: aws-account
+#aws_role_arn: arn:iam:::111111111111/role
+
+dms_instance:
+  replication_instance_identifier: example-dms
+  publicly_accessible: false
+  allocated_storage: 50
+  replication_instance_class: dms.t2.medium
+  replication_subnet_group_identifier: subnet-id
+  vpc_security_group_ids:
+    - sg-id
+
+source:
+  host: source.example.com
+  engine: SQLSERVER
+  port: 1433
+  username: user
+  password: pass
+  databases:
+    source01.example.com:
+      - database01
+      - database02
+
+target:
+  engine: SQLSERVER
+  port: 1433
+  username: user
+  password: pass
+  databases:
+    target01.example.com:
+      - database01
+    target02.example.com:
+      - database02
+
+tasks:
+  migration_type:
+    default: full-load
+  table_mappings:
+    default:
+      TableMappings:
+        -
+          Type: Include
+          SourceSchema: company
+          SourceTable: "emp%"
+        -
+          Type: Include
+          SourceSchema: employees
+          SourceTable: "%"
+        -
+          Type: Exclude
+          SourceSchema: source101
+          SourceTable: "dep%"

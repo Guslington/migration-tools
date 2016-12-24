@@ -1,0 +1,438 @@
+require 'aws-sdk'
+require 'yaml'
+require 'rake'
+
+STDOUT.sync = true
+
+namespace :dms do
+
+  config = YAML.load(File.read("default_params.yml"))
+  dms_endpoints = ['source','target']
+
+  desc('Create replication instance')
+  task :create_instance do
+    puts "INFO: Creating DMS replication instance"
+
+    dms_instance = get_replication_instance(config)
+
+    if !dms_instance
+
+      dms = get_dms_client(config)
+
+      if create_replication_instance
+        begin
+          puts "INFO: Creating DMS replication instance"
+          dms.create_replication_instance(config['dms_instance'])
+          puts "INFO: Created DMS replication instance STATUS: #{resp.replication_instance.replication_instance_status}"
+          wait_for_replication_instance(config)
+        rescue => e
+          abort("ERROR: #{e}, #{e.class}")
+        end
+      end
+
+    end
+  end
+
+  desc('Modify replication instance')
+  task :update_instance do
+
+    dms_instance = get_replication_instance(config)
+    unless !dms_instance
+      replication_instance_arn = get_replication_instance(config)
+      options = config['dms_instance'].merge({
+        apply_immediately: true,
+        replication_instance_arn: replication_instance_arn,
+        replication_subnet_group_identifier: replication_subnet_group_identifier,
+      })
+      begin
+        puts "INFO: Updating DMS replication instance"
+        resp = client.modify_replication_instance(options)
+        puts "INFO: Updated DMS replication instance STATUS: #{resp.replication_instance.replication_instance_status}"
+        wait_for_replication_instance(config)
+      rescue => e
+        abort("ERROR: #{e}, #{e.class}")
+      end
+    end
+
+  end
+
+  desc('Delete replication instance')
+  task :delete_instance do
+    puts "INFO: Deleting #{config['dms_instance']['id']} DMS replication instance"
+    dms_instance = get_replication_instance(config)
+    unless !dms_instance
+      resp = client.delete_replication_instance({
+        replication_instance_arn: dms_instance
+      })
+      puts "INFO: Deleted #{config['dms_instance']['id']} STATUS: #{resp.replication_instance.replication_instance_status}"
+    end
+  end
+
+  desc('Create endpoints')
+  task :create_endpoints do
+    puts "INFO: Creating endpoints"
+    dms_endpoints.each do |endpoint|
+      config[endpoint]['databases'].each_pair do |host, databases|
+        databases.each do |db|
+          create_ep(config,endpoint,db,host)
+        end
+      end
+    end
+  end
+
+  desc('Modify endpoints')
+  task :update_endpoints do
+    puts "INFO: Modifying endpoints"
+    dms_endpoints.each do |endpoint|
+      config[endpoint]['databases'].each_pair do |host, databases|
+        databases.each do |db|
+          endpoint_arn = get_endpoint(config,endpoint,db)
+          if !endpoint_arn
+            puts "WARN: Endpoint #{db.gsub('_','-')}-#{endpoint} NOT found"
+          else
+            update_endpoint(config,endpoint,db,endpoint_arn,host)
+          end
+        end
+      end
+    end
+  end
+
+
+  desc('Delete endpoints')
+  task :delete_endpoints do
+    puts "INFO: Deleting endpoints"
+    dms_endpoints.each do |endpoint|
+      config[endpoint]['databases'].each_pair do |host, databases|
+        databases.each do |db|
+          delete_ep(config,endpoint,db)
+        end
+      end
+    end
+  end
+
+  desc('Create replication tasks')
+  task :create_tasks do
+
+    dms = get_dms_client(config)
+    puts "INFO: Creating replication tasks"
+
+    config['target']['databases'].each_pair do |host, databases|
+      databases.each do |db|
+        source_endpoint_arn = get_endpoint(config,"source",db)
+        target_endpoint_arn = get_endpoint(config,"target",db)
+
+        if !source_endpoint_arn && !target_endpoint_arn
+
+          table_mappings = (config['task']['table_mappings'].key(db)) ? config['task']['table_mappings'][db] : config['task']['table_mappings']['default']
+          migration_type = (config['task']['migration_type'].key(db)) ? config['task']['migration_type'][db] : config['task']['migration_type']['default']
+
+          begin
+            resp = dms.create_replication_task({
+              replication_task_identifier: "#{db.gsub('_','-')}-task",
+              source_endpoint_arn: source_endpoint_arn,
+              target_endpoint_arn: target_endpoint_arn,
+              replication_instance_arn: replication_instance_arn,
+              migration_type: migration_type,
+              table_mappings: JSON.pretty_generate(table_mappings),
+            })
+            puts "INFO: Created #{db.gsub('_','-')}-task STATUS: #{resp.replication_task.status}"
+          rescue Aws::DatabaseMigrationService::Errors::ResourceAlreadyExistsFault
+            puts "WARN: #{db.gsub('_','-')}-task already exists, skipping"
+          end
+        end
+
+      end
+    end
+  end
+
+  desc('Delete replication tasks')
+  task :delete_tasks do
+    dms = get_dms_client(config)
+    puts "INFO: Deleting replication tasks"
+    config['target']['databases'].each_pair do |host, databases|
+      databases.each do |db|
+        replication_task = get_task(config,db)
+        unless !replication_task
+          puts "INFO: Starting #{db.gsub('_','-')}-task"
+          resp = dms.delete_replication_task({
+            replication_task_arn: replication_task
+          })
+        end
+      end
+    end
+  end
+
+  desc('Modify replication task')
+  task :update_tasks do
+    puts "INFO: Modify replication tasks"
+
+    dms = get_dms_client(config)
+    puts "INFO: Creating replication tasks"
+
+    config['target']['databases'].each_pair do |host, databases|
+      databases.each do |db|
+
+        replication_task_arn = get_task(config,db)
+        table_mappings = (config['task']['table_mappings'].key(db)) ? config['task']['table_mappings'][db] : config['task']['table_mappings']['default']
+        migration_type = (config['task']['migration_type'].key(db)) ? config['task']['migration_type'][db] : config['task']['migration_type']['default']
+
+        unless !replication_task_arn
+          resp = client.modify_replication_task({
+            replication_task_arn: replication_task_arn,
+            migration_type: migration_type,
+            table_mappings: JSON.pretty_generate(table_mappings),
+          })
+          puts "INFO: Modified #{db.gsub('_','-')}-task STATUS: #{resp.replication_task.status}"
+        end
+      end
+    end
+  end
+
+  desc('Start replication tasks')
+  task :start_tasks do
+
+    dms = get_dms_client(config)
+    puts "INFO: Starting replication tasks"
+
+    config['target']['databases'].each_pair do |host, databases|
+      databases.each do |db|
+        replication_task = get_task(config,db)
+        unless !replication_task
+          puts "INFO: Starting #{db.gsub('_','-')}-task"
+          resp = dms.start_replication_task({
+            replication_task_arn: replication_task,
+            start_replication_task_type: "start-replication",
+          })
+        end
+      end
+    end
+  end
+
+  desc('Stop replication tasks')
+  task :stop_tasks do
+
+    dms = get_dms_client(config)
+    puts "INFO: Stopping replication tasks"
+
+    config['target']['databases'].each_pair do |host, databases|
+      databases.each do |db|
+        replication_task = get_task(config,db)
+        unless !replication_task
+          puts "INFO: Stopping #{db.gsub('_','-')}-task"
+          resp = dms.stop_replication_task({
+            replication_task_arn: replication_task
+          })
+        end
+      end
+    end
+  end
+
+  desc('test connections of endpoints')
+  task :test_endpoints do
+    puts "INFO: testing all endpoints"
+    replication_instance_arn = get_replication_instance(config)
+    dms_endpoints.each do |endpoint|
+      config[endpoint]['databases'].each_pair do |host, databases|
+        databases.each do |db|
+
+          endpoint_arn = get_endpoint(config,endpoint,db)
+          test_endpoint(config,endpoint_arn,replication_instance_arn) unless !endpoint_arn
+
+        end
+      end
+    end
+  end
+
+  def get_dms_client(config)
+    if config.key('aws_role')
+      credentials = Aws::AssumeRoleCredentials.new(role_arn: config['aws_role'], role_session_name: "migration-tools-dms", region: config['region'])
+      type = "IAM Role"
+    elsif config.key('aws_profile')
+      credentials = Aws::SharedCredentials.new(profile_name: config['aws_profile'])
+      type = "profile"
+    else
+      abort("ERROR: No credentails specified in default_params.yml\nPlease specify aws_profile: 'profile' or aws_role: 'role_arn'")
+    end
+
+    puts "INFO: Creating DMS client using #{type}"
+    client = Aws::DatabaseMigrationService::Client.new(region: config['region'],credentials: credentials)
+    return client
+  end
+
+  def get_replication_instance(config)
+    client = get_dms_client(config)
+    begin
+      resp = client.describe_replication_instances({
+        filters: [{name: "replication-instance-id",values: [config['dms_instance']['id']]}]
+      })
+      puts "INFO: Found #{config['dms_instance']['id']} STATUS: #{resp.replication_instances[0].replication_instance_status}"
+      return resp.replication_instances[0].replication_instance_arn
+    rescue Aws::DatabaseMigrationService::Errors::ResourceNotFoundFault
+      puts "WARN: Replication Instance #{config['dms_instance']['id']} not found"
+      return false
+    end
+  end
+
+  def create_ep(config,endpoint,database,host)
+    client = get_dms_client(config)
+    puts "INFO: Creating #{endpoint} endpoint for #{database} on #{host}"
+
+    begin
+      ep = client.create_endpoint({
+        endpoint_identifier: "#{database.gsub('_','-')}-#{endpoint}",
+        endpoint_type: endpoint,
+        engine_name: config[endpoint]['engine'],
+        username: config[endpoint]['username'],
+        password: config[endpoint]['password'],
+        server_name: host,
+        port: config[endpoint]['port'],
+        database_name: "#{database}",
+        ssl_mode: "none",
+      })
+      return ep.endpoint.endpoint_arn
+    rescue Aws::DatabaseMigrationService::Errors::ResourceAlreadyExistsFault
+      puts "WARN: Endpoint #{database.gsub('_','-')}-#{endpoint}} already exists"
+      return false
+    end
+
+  end
+
+  def update_endpoint(config,endpoint,database,arn,host)
+    client = get_dms_client(config)
+    puts "INFO: Modifying #{endpoint} endpoint for #{database} on #{host}"
+    begin
+      resp = client.modify_endpoint({
+        endpoint_arn: arn,
+        endpoint_type: endpoint,
+        engine_name: config[endpoint]['engine'],
+        username: config[endpoint]['username'],
+        password: config[endpoint]['password'],
+        server_name: host,
+        port: config[endpoint]['port'],
+        database_name: "#{database}",
+        ssl_mode: "none",
+      })
+    rescue Aws::DatabaseMigrationService::Errors::ResourceNotFoundFault
+      puts "WARN: Endpoint #{database.gsub('_','-')}-#{endpoint} NOT found"
+      return false
+    end
+  end
+
+  def delete_ep(config,endpoint,database)
+    arn = get_endpoint(config,endpoint,database)
+    unless !arn
+      client = get_dms_client(config)
+      begin
+        resp = client.delete_endpoint({
+          endpoint_arn: arn,
+        })
+        puts "INFO: Deleted #{endpoint} endpoint for #{database}, STATUS: #{resp.endpoint.status}"
+      rescue => e
+        puts "ERROR: #{e}, #{e.class}"
+      end
+    end
+  end
+
+  def get_endpoint(config,endpoint,database)
+    client = get_dms_client(config)
+
+    begin
+      ep = client.describe_endpoints({
+        filters: [{name: "endpoint-id",values: ["#{database.gsub('_','-')}-#{endpoint}"]}]
+      })
+      puts "INFO: Endpoint #{database.gsub('_','-')}-#{endpoint}} found"
+      return ep.endpoints[0].endpoint_arn
+    rescue Aws::DatabaseMigrationService::Errors::ResourceNotFoundFault
+      puts "WARN: Endpoint #{database.gsub('_','-')}-#{endpoint} NOT found"
+      return false
+    end
+  end
+
+  def get_task(config,database)
+    client = get_dms_client(config)
+    begin
+      resp = client.describe_replication_tasks({
+        filters: [{name: "replication-task-id", values: ["#{database.gsub('_','-')}-task"]}]
+      })
+      puts "INFO: Found #{database.gsub('_','-')}-task"
+      return resp.replication_tasks[0].replication_task_arn
+    rescue Aws::DatabaseMigrationService::Errors::ResourceNotFoundFault
+      puts "ERROR: Task #{db.gsub('_','-')}-task not found, skipping..."
+      return false
+    end
+  end
+
+  def wait_for_replication_instance(config)
+
+    timeout = 600
+    available = false
+    started_at = Time.now
+
+    puts "INFO: Waiting for replication instance to become avaialable"
+    while !available
+      resp = get_replication_instance(config)
+      if resp.replication_instances[0].replication_instance_status == 'available'
+        available = true
+      elsif Time.now - started_at > timeout
+        raise "Waiting for replication instance timed out after #{timeout} seconds"
+      else
+        puts "STATUS: #{resp.replication_instances[0].replication_instance_status}"
+        sleep 5
+      end
+    end
+
+  end
+
+  def wait_for_endpoints(config,target_endpoint_arn,source_endpoint_arn)
+
+    timeout = 300
+    active = false
+    started_at = Time.now
+    dms = get_dms_client(config)
+
+    puts "INFO: Waiting for endpoints instance to become active"
+    while !active
+      resp = dms.describe_endpoints({
+        filters: [{name: "endpoint-arn", values: ["#{target_endpoint_arn}","#{source_endpoint_arn}"]}]
+      })
+      if resp.endpoints[0].status == 'active' && resp.endpoints[1].status == 'active'
+        active = true
+      elsif Time.now - started_at > timeout
+        raise "Waiting for endpoints to become active timed out after #{timeout} seconds"
+      else
+        puts "STATUS: source:- #{resp.endpoints[0].status} | target:- #{resp.endpoints[1].status}"
+        sleep 5
+      end
+    end
+  end
+
+  def test_endpoint(config,endpoint_arn,replication_instance_arn)
+
+    timeout = 300
+    testing = true
+    started_at = Time.now
+    client = get_dms_client(config)
+
+    client.test_connection({
+      replication_instance_arn: replication_instance_arn,
+      endpoint_arn: endpoint_arn,
+    })
+
+    while testing
+      resp = client.describe_connections({
+        filters: [{name: "endpoint-arn",values: [endpoint_arn]}]
+      })
+      if resp.connections[0].status == 'complete'
+        puts resp.connections[0].last_failure_message
+        testing = false
+      elsif Time.now - started_at > timeout
+        raise "Waiting for endpoints to become active timed out after #{timeout} seconds"
+      else
+        puts "STATUS: source:- #{resp.endpoints[0].status} | target:- #{resp.endpoints[1].status}"
+        sleep 5
+      end
+    end
+
+  end
+
+end
