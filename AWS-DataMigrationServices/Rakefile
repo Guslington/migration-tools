@@ -18,16 +18,14 @@ namespace :dms do
     if !dms_instance
 
       dms = get_dms_client(config)
-
-      if create_replication_instance
-        begin
-          puts "INFO: Creating DMS replication instance"
-          dms.create_replication_instance(config['dms_instance'])
-          puts "INFO: Created DMS replication instance STATUS: #{resp.replication_instance.replication_instance_status}"
-          wait_for_replication_instance(config)
-        rescue => e
-          abort("ERROR: #{e}, #{e.class}")
-        end
+      options =  Hash[config['dms_instance'].map{ |k, v| [k.to_sym, v] }]
+      begin
+        puts "INFO: Creating DMS replication instance"
+        resp = dms.create_replication_instance(options)
+        puts "INFO: Created DMS replication instance STATUS: #{resp.replication_instance.replication_instance_status}"
+        wait_for_replication_instance(config)
+      rescue => e
+        abort("ERROR: #{e}, #{e.class}")
       end
 
     end
@@ -120,11 +118,12 @@ namespace :dms do
       databases.each do |db|
         source_endpoint_arn = get_endpoint(config,"source",db)
         target_endpoint_arn = get_endpoint(config,"target",db)
+        replication_instance_arn = get_replication_instance(config)
 
-        if !source_endpoint_arn && !target_endpoint_arn
+        unless !source_endpoint_arn && !target_endpoint_arn && !replication_instance_arn
 
-          table_mappings = (config['task']['table_mappings'].key(db)) ? config['task']['table_mappings'][db] : config['task']['table_mappings']['default']
-          migration_type = (config['task']['migration_type'].key(db)) ? config['task']['migration_type'][db] : config['task']['migration_type']['default']
+          table_mappings = (config['tasks']['table_mappings'].key(db)) ? config['tasks']['table_mappings'][db] : config['tasks']['table_mappings']['default']
+          migration_type = (config['tasks']['migration_type'].key(db)) ? config['tasks']['migration_type'][db] : config['tasks']['migration_type']['default']
 
           begin
             resp = dms.create_replication_task({
@@ -139,6 +138,8 @@ namespace :dms do
           rescue Aws::DatabaseMigrationService::Errors::ResourceAlreadyExistsFault
             puts "WARN: #{db.gsub('_','-')}-task already exists, skipping"
           end
+        else
+          abort "ERROR: Endpoint or replication instance not found"
         end
 
       end
@@ -236,7 +237,7 @@ namespace :dms do
         databases.each do |db|
 
           endpoint_arn = get_endpoint(config,endpoint,db)
-          test_endpoint(config,endpoint_arn,replication_instance_arn) unless !endpoint_arn
+          test_endpoint(config,endpoint_arn,replication_instance_arn,db,endpoint) unless !endpoint_arn
 
         end
       end
@@ -244,10 +245,10 @@ namespace :dms do
   end
 
   def get_dms_client(config)
-    if config.key('aws_role')
+    if config.key?('aws_role')
       credentials = Aws::AssumeRoleCredentials.new(role_arn: config['aws_role'], role_session_name: "migration-tools-dms", region: config['region'])
       type = "IAM Role"
-    elsif config.key('aws_profile')
+    elsif config.key?('aws_profile')
       credentials = Aws::SharedCredentials.new(profile_name: config['aws_profile'])
       type = "profile"
     else
@@ -263,7 +264,7 @@ namespace :dms do
     client = get_dms_client(config)
     begin
       resp = client.describe_replication_instances({
-        filters: [{name: "replication-instance-id",values: [config['dms_instance']['id']]}]
+        filters: [{name: "replication-instance-id",values: [config['dms_instance']['replication_instance_identifier']]}]
       })
       puts "INFO: Found #{config['dms_instance']['id']} STATUS: #{resp.replication_instances[0].replication_instance_status}"
       return resp.replication_instances[0].replication_instance_arn
@@ -340,7 +341,7 @@ namespace :dms do
       ep = client.describe_endpoints({
         filters: [{name: "endpoint-id",values: ["#{database.gsub('_','-')}-#{endpoint}"]}]
       })
-      puts "INFO: Endpoint #{database.gsub('_','-')}-#{endpoint}} found"
+      puts "INFO: found endpoint #{database.gsub('_','-')}-#{endpoint}"
       return ep.endpoints[0].endpoint_arn
     rescue Aws::DatabaseMigrationService::Errors::ResourceNotFoundFault
       puts "WARN: Endpoint #{database.gsub('_','-')}-#{endpoint} NOT found"
@@ -352,12 +353,12 @@ namespace :dms do
     client = get_dms_client(config)
     begin
       resp = client.describe_replication_tasks({
-        filters: [{name: "replication-task-id", values: ["#{database.gsub('_','-')}-task"]}]
+        filters: [{name: "replication-task-id", values: ["#{database.downcase.gsub('_','-')}-task"]}]
       })
-      puts "INFO: Found #{database.gsub('_','-')}-task"
+      puts "INFO: Found #{database.downcase.gsub('_','-')}-task"
       return resp.replication_tasks[0].replication_task_arn
     rescue Aws::DatabaseMigrationService::Errors::ResourceNotFoundFault
-      puts "ERROR: Task #{db.gsub('_','-')}-task not found, skipping..."
+      puts "ERROR: Task #{database.downcase.gsub('_','-')}-task not found, skipping..."
       return false
     end
   end
@@ -406,7 +407,7 @@ namespace :dms do
     end
   end
 
-  def test_endpoint(config,endpoint_arn,replication_instance_arn)
+  def test_endpoint(config,endpoint_arn,replication_instance_arn,db,endpoint)
 
     timeout = 300
     testing = true
@@ -418,20 +419,28 @@ namespace :dms do
       endpoint_arn: endpoint_arn,
     })
 
+    puts "INFO: Testing #{db.gsub('_','-')}-#{endpoint}"
+
     while testing
-      resp = client.describe_connections({
-        filters: [{name: "endpoint-arn",values: [endpoint_arn]}]
-      })
-      if resp.connections[0].status == 'complete'
-        puts resp.connections[0].last_failure_message
-        testing = false
-      elsif Time.now - started_at > timeout
-        raise "Waiting for endpoints to become active timed out after #{timeout} seconds"
-      else
-        puts "STATUS: source:- #{resp.endpoints[0].status} | target:- #{resp.endpoints[1].status}"
-        sleep 5
+      begin
+        resp = client.describe_connections({
+          filters: [{name: "endpoint-arn",values: [endpoint_arn]}]
+        })
+        if resp.connections[0].status == 'successful'
+          testing = false
+        elsif Time.now - started_at > timeout
+          abort "Waiting for endpoints to become active timed out after #{timeout} seconds"
+        else
+          puts "STATUS: #{resp.connections[0].status}"
+          sleep 5
+        end
+      rescue Aws::DatabaseMigrationService::Errors::InvalidResourceStateFault => e
+        puts "INFO: #{e}"
       end
     end
+
+    puts "FINAL STATUS: #{resp.connections[0].status} #{puts resp.connections[0].last_failure_message}"
+    puts ""
 
   end
 
